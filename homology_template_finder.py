@@ -8,13 +8,21 @@ writes everything to a formatted Excel workbook.
 
 Designed for Google Colab (needs: requests, pandas, numpy, openpyxl;
 Biopython is optional and only used for the NCBI BLAST fallback / realignment).
+
+Several choices follow the ColabFold paper (Mirdita et al., Nature Methods 2022):
+a profile-based template search through the ColabFold MMseqs2 server, redundancy
+clustering at 95% identity with identity-band picks so remote templates stay visible,
+a retry without low-complexity masking when masking may have hidden homologs, and a
+hand-off file for ColabFold when no good template exists.
 """
 
 import io
 import json
 import math
 import os
+import random
 import re
+import tarfile
 import time
 import zipfile
 from collections import defaultdict
@@ -29,7 +37,9 @@ import requests
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = {
     "query": "P69905",              # UniProt acc, PDB ID (e.g. 4HHB or 4HHB_A) or sequence/FASTA
-    "search_engine": "rcsb",        # "rcsb" (fast MMseqs2) or "ncbi" (BLASTp vs pdb, slower)
+    "search_engine": "rcsb",        # "rcsb" (fast MMseqs2, pairwise), "ncbi" (BLASTp vs pdb, slower)
+                                    # or "colabfold" (MSA-profile search of the PDB via the ColabFold
+                                    # MMseqs2 server; best for remote homologs, takes a few minutes)
     "evalue_cutoff": 10.0,          # loose -> finds remote homologs; tighten to 1e-3 for confident ones
     "min_identity_pct": 0,          # pre-filter on sequence identity (%)
     "max_identity_pct": 100,        # set e.g. 99 to drop the query's own structures
@@ -37,26 +47,38 @@ DEFAULT_CONFIG = {
     "max_hits": 5000,               # safety cap
     "exclude_pdb_ids": [],          # e.g. ["4HHB"]
     "exclude_query_entry": False,   # if the query is a PDB ID, drop that entry from results
+    "max_release_date": "",         # "YYYY-MM-DD": drop templates released later (benchmarking)
     "prefer_organism": "",          # optional: "Homo sapiens" -> adds a 'same organism' flag
     "weights": {                    # composite score weights (normalised automatically)
-        "identity": 0.30,
+        "identity": 0.25,
         "similarity": 0.05,
-        "coverage": 0.25,
+        "coverage": 0.20,
+        "significance": 0.10,       # search E-value: E=10 -> 0, E<=1e-30 -> 1
         "resolution": 0.15,
         "completeness": 0.10,
         "r_free": 0.075,
         "geometry": 0.075,
     },
+    "redundancy_identity_pct": 95,  # templates this similar to a better one (over shared query
+                                    # positions) are grouped; set 100 to switch off
+    "diverse_per_band": 2,          # best non-redundant templates listed per identity-to-query band
+    "low_complexity_retry": True,   # re-search NCBI without masking/composition filters if few hits
+    "low_complexity_min_hits": 5,   # ... i.e. when fewer than this many hits come back
+    "colabfold_host": "https://api.colabfold.com",
+    "colabfold_handoff": "auto",    # "auto" (only if no tier A/B template or uncovered regions), "always", "never"
     "n_alignments_in_excel": 50,    # how many top hits get full alignments in the workbook
     "n_coverage_map": 50,           # how many top unique templates in the coverage map
     "coverage_bin": 10,             # residues per coverage-map column
-    "download_top_n": 0,            # download top-N unique template structures (PDB/mmCIF) as a zip
+    "download_top_n": 0,            # download top-N unique template structures as a zip
+                                    # (lower-case mmCIF, usable as ColabFold custom templates)
     "output_prefix": "homology_templates",
 }
 
 RCSB_SEARCH = "https://search.rcsb.org/rcsbsearch/v2/query"
 RCSB_GRAPHQL = "https://data.rcsb.org/graphql"
-HEADERS = {"User-Agent": "HomologyTemplateFinder/1.0 (Colab)"}
+HEADERS = {"User-Agent": "HomologyTemplateFinder/1.1 (Colab; github.com/victorolatunde23-dev/homology_modelling_task)"}
+
+IDENTITY_BANDS = [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100.01)]
 
 # Crystallisation additives / buffers / ions that are rarely relevant for modelling
 COMMON_ADDITIVES = set("""
@@ -283,13 +305,20 @@ def search_rcsb(sequence, evalue_cutoff=10.0, identity_cutoff=0.0, max_hits=5000
     return list(best.values())
 
 
-def search_ncbi(sequence, evalue_cutoff=10.0, max_hits=5000):
-    """BLASTp against NCBI 'pdb' database (slower, needs Biopython)."""
+def search_ncbi(sequence, evalue_cutoff=10.0, max_hits=5000, unmasked=False):
+    """BLASTp against NCBI 'pdb' database (slower, needs Biopython).
+
+    unmasked=True switches off the low-complexity filter and composition-based statistics.
+    The ColabFold paper traced a missed homolog (CASP14 T1084) to exactly this kind of
+    filtering, so this is used as a second chance for low-complexity / repetitive queries.
+    """
     from Bio.Blast import NCBIWWW, NCBIXML  # noqa: WPS433
-    print("  Submitting BLASTp to NCBI (this can take a few minutes)...")
+    extra = {"filter": "F", "composition_based_statistics": 0} if unmasked else {}
+    print("  Submitting BLASTp to NCBI%s (this can take a few minutes)..."
+          % (" without masking/composition filters" if unmasked else ""))
     handle = NCBIWWW.qblast("blastp", "pdb", sequence, expect=evalue_cutoff,
                             hitlist_size=min(max_hits, 5000), alignments=min(max_hits, 5000),
-                            descriptions=min(max_hits, 5000))
+                            descriptions=min(max_hits, 5000), **extra)
     rec = NCBIXML.read(handle)
     raw = []
     for aln in rec.alignments:
@@ -306,9 +335,13 @@ def search_ncbi(sequence, evalue_cutoff=10.0, max_hits=5000):
                 "subject_length": aln.length,
                 "query_aligned_seq": hsp.query, "subject_aligned_seq": hsp.sbjct,
             })
+    return _chain_hits_to_entities(raw)
+
+
+def _chain_hits_to_entities(raw):
+    """Map chain-level hits (pdb_id + chain) to polymer entities; keep the best hit per entity."""
     if not raw:
         return []
-    # map auth chains -> polymer entity ids
     pdb_ids = sorted({h["pdb_id"] for h in raw})
     chain2ent = {}
     q = """query($ids:[String!]!){ entries(entry_ids:$ids){ rcsb_id
@@ -327,9 +360,95 @@ def search_ncbi(sequence, evalue_cutoff=10.0, max_hits=5000):
             continue
         h = dict(h, entity_id=ent, hit_chains=h["chain"])
         h.pop("chain")
-        if ent not in best or h["bitscore"] > best[ent]["bitscore"]:
+        if ent not in best or (h["bitscore"] or 0) > (best[ent]["bitscore"] or 0):
             best[ent] = h
     return list(best.values())
+
+
+def search_colabfold(sequence, evalue_cutoff=10.0, max_hits=5000,
+                     host="https://api.colabfold.com", workdir=".", timeout_min=45):
+    """Profile-based template search through the ColabFold MMseqs2 server.
+
+    The server builds an MSA of the query (3 iterations against UniRef30 + environmental
+    databases) and searches the PDB with that profile - the template search ColabFold uses
+    for AlphaFold2. It finds remote homologs that a single pairwise search misses.
+    Returns (hits, msa_info). Hits carry the profile-search region; the alignment itself is
+    recomputed pairwise inside that region in build_table().
+    Please be considerate: the shared server handles roughly 20-50k requests per day.
+    """
+    seq = re.sub(r"[^A-Z]", "", sequence.upper())
+    os.makedirs(workdir, exist_ok=True)
+    tar_path = os.path.join(workdir, "colabfold_msa.tar.gz")
+
+    def call(method, path, **kw):
+        last = None
+        for attempt in range(8):
+            try:
+                r = requests.request(method, f"{host}/{path}", headers=HEADERS, timeout=30, **kw)
+                if r.status_code >= 500:
+                    raise requests.HTTPError(f"HTTP {r.status_code}")
+                return r
+            except Exception as e:  # noqa: BLE001
+                last = e
+                time.sleep(5 + 2 * attempt)
+        raise RuntimeError(f"ColabFold server request failed: {last}")
+
+    print("  Submitting to the ColabFold MMseqs2 server (MSA + PDB template search, a few minutes)...")
+    deadline = time.time() + 60 * timeout_min
+    out = call("POST", "ticket/msa", data={"q": f">101\n{seq}\n", "mode": "env"}).json()
+    while out.get("status") in ("UNKNOWN", "RATELIMIT"):
+        time.sleep(5 + random.randint(0, 5))
+        out = call("POST", "ticket/msa", data={"q": f">101\n{seq}\n", "mode": "env"}).json()
+    if out.get("status") == "MAINTENANCE":
+        raise RuntimeError("ColabFold MMseqs2 server is under maintenance; try again later or use 'rcsb'.")
+    while out.get("status") in ("PENDING", "RUNNING"):
+        if time.time() > deadline:
+            raise RuntimeError("ColabFold MMseqs2 server did not finish in time; try again later.")
+        time.sleep(5 + random.randint(0, 5))
+        out = call("GET", f"ticket/{out['id']}").json()
+    if out.get("status") != "COMPLETE":
+        raise RuntimeError(f"ColabFold MMseqs2 server error (status {out.get('status')}). "
+                           "Check that the query is a valid protein sequence.")
+    r = call("GET", f"result/download/{out['id']}")
+    with open(tar_path, "wb") as fh:
+        fh.write(r.content)
+
+    m8, a3m_counts = "", {}
+    with tarfile.open(tar_path) as tar:
+        for member in tar.getmembers():
+            name = os.path.basename(member.name)
+            if name == "pdb70.m8" or name.endswith(".a3m"):
+                text = tar.extractfile(member).read().decode("utf-8", "replace").replace("\x00", "")
+                if name == "pdb70.m8":
+                    m8 = text
+                else:
+                    a3m_counts[name] = max(0, text.count("\n>") + text.startswith(">") - 1)
+    msa_info = {"msa_sequences": sum(a3m_counts.values()), "msa_files": a3m_counts}
+
+    raw = []
+    for line in m8.splitlines():
+        p = line.split()
+        if len(p) < 12:
+            continue
+        target = p[1]
+        if "_" not in target:
+            continue
+        pdb_id, chain = target.split("_", 1)
+        evalue = float(p[10])
+        if evalue > evalue_cutoff:
+            continue
+        raw.append({
+            "pdb_id": pdb_id.upper(), "chain": chain,
+            "evalue": evalue, "bitscore": float(p[11]),
+            "search_identity": float(p[2]),
+            "query_beg": int(p[6]), "query_end": int(p[7]),
+            "subject_beg": int(p[8]), "subject_end": int(p[9]),
+            "subject_length": None, "query_aligned_seq": None, "subject_aligned_seq": None,
+            "region_hint": (int(p[6]), int(p[7]), int(p[8]), int(p[9])),
+        })
+        if len(raw) >= max_hits:
+            break
+    return _chain_hits_to_entities(raw), msa_info
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +727,36 @@ def hssp_threshold(L):
     return min(100.0, 480.0 * L ** (-0.32 * (1 + math.exp(-L / 1000.0))))
 
 
+def low_complexity_fraction(seq, window=12, max_bits=2.2):
+    """Fraction of residues inside low-complexity windows (Shannon entropy <= max_bits).
+
+    Same window and trigger threshold as SEG's defaults (12 residues, 2.2 bits). Queries
+    with many such residues are the ones where masking can hide real homologs.
+    """
+    seq = seq.upper()
+    n = len(seq)
+    if n < window:
+        return 0.0
+    low = np.zeros(n, dtype=bool)
+    for i in range(n - window + 1):
+        w = seq[i:i + window]
+        counts = np.array([w.count(c) for c in set(w)], dtype=float) / window
+        if -(counts * np.log2(counts)).sum() <= max_bits:
+            low[i:i + window] = True
+    return float(low.mean())
+
+
+def align_in_region(qseq, tseq, hint):
+    """Pairwise realignment restricted to the query/template region a profile search reported."""
+    qb, qe, tb, te = hint
+    if not (1 <= qb <= qe <= len(qseq)) or not (1 <= tb <= te <= len(tseq)):
+        return local_align(qseq, tseq)
+    pad = 10  # allow the pairwise alignment to extend a little past the profile hit
+    q0, t0 = max(0, qb - 1 - pad), max(0, tb - 1 - pad)
+    qa, sa, qs, qend, ts, tend = local_align(qseq[q0:qe + pad], tseq[t0:te + pad])
+    return qa, sa, qs + q0, qend + q0, ts + t0, tend + t0
+
+
 def query_positions_covered(qa, sa, qbeg):
     """Set of query residue indices (1-based) aligned to a template residue."""
     pos, qi = set(), qbeg
@@ -647,6 +796,13 @@ def component_scores(row):
     s["identity"] = _lin(row["identity_pct"], 20, 100)
     s["similarity"] = _lin(row["similarity_pct"], 30, 100)
     s["coverage"] = _lin(row["query_coverage_pct"], 0, 100)
+    # search significance: -log10(E) from -1 (E=10) to 30 (E=1e-30); identity alone is a weak
+    # signal for short local hits, the E-value accounts for alignment length and score
+    e = row.get("evalue")
+    if e is None or (isinstance(e, float) and math.isnan(e)):
+        s["significance"] = 0.5
+    else:
+        s["significance"] = 1.0 if e <= 0 else _lin(-math.log10(e), -1, 30)
     res = row.get("resolution")
     if "NMR" in meth and (res is None or pd.isna(res)):
         s["resolution"] = 0.35
@@ -695,8 +851,13 @@ def build_table(query_info, hits, meta, cfg):
         if not qa or not sa or len(qa) != len(sa):
             if not m["entity_sequence"]:
                 continue
-            qa, sa, qb, qe, sb, se = local_align(qseq, m["entity_sequence"])
+            if h.get("region_hint"):
+                qa, sa, qb, qe, sb, se = align_in_region(qseq, m["entity_sequence"], h["region_hint"])
+            else:
+                qa, sa, qb, qe, sb, se = local_align(qseq, m["entity_sequence"])
             h.update(query_beg=qb, query_end=qe, subject_beg=sb, subject_end=se)
+            if not qa:
+                continue
         qa, sa = qa.upper(), sa.upper()
         st = alignment_stats(qa, sa)
         aligned_cols = st["aln_len"] - st["gaps_in_query"] - st["gaps_in_template"]
@@ -764,6 +925,7 @@ def build_table(query_info, hits, meta, cfg):
             "release_date": m["release_date"],
             "title": m["title"],
             "same_organism": (pref_org in (m["organism"] or "").lower()) if pref_org else None,
+            "found_by": h.get("found_by", cfg["search_engine"]),
             "_entity_sequence": m["entity_sequence"],
         }
         rows.append(row)
@@ -782,6 +944,12 @@ def build_table(query_info, hits, meta, cfg):
         excl.add(query_info["pdb_entry"].upper())
     if excl:
         df = df[~df.pdb_id.isin(excl)]
+    if cfg.get("max_release_date"):
+        cutoff = str(cfg["max_release_date"])[:10]
+        df = df[(df.release_date.fillna("") != "") & (df.release_date.fillna("") <= cutoff)]
+    df = df.copy()
+    if df.empty:
+        return df, coverage_sets, aln_store
 
     # scoring
     w = cfg["weights"]
@@ -811,8 +979,15 @@ def build_table(query_info, hits, meta, cfg):
             f.append(f"{int(r.mutations)} mutation(s)")
         if r.n_protein_entities and r.n_protein_entities > 1:
             f.append("complex with other proteins")
+        elif isinstance(r.oligomeric_state, str) and r.oligomeric_state.lower().startswith("homo"):
+            f.append(f"homo-oligomer ({r.stoichiometry or r.oligomeric_state}): model the assembly "
+                     "if it is functional; for predicted complexes rank by ipTM/PAE, not pLDDT")
         if not r.homology_reliable:
             f.append("below HSSP curve")
+        if r.found_by == "ncbi-unmasked":
+            f.append("found only without low-complexity masking: check the alignment carefully")
+        if r.found_by == "colabfold" and r.identity_pct < 30:
+            f.append("profile hit: alignment shown is a pairwise realignment, refine it before modelling")
         warn.append("; ".join(f))
     df["warnings"] = warn
 
@@ -835,6 +1010,76 @@ def unique_templates(df):
     u = u.reset_index(drop=True)
     u.insert(0, "unique_rank", range(1, len(u) + 1))
     return u
+
+
+def _query_anchored_residues(qa, sa, qbeg, qlen):
+    """Array over query positions holding the template residue aligned there (0 = none)."""
+    arr = np.zeros(qlen + 1, dtype=np.int16)
+    qi = qbeg
+    for x, y in zip(qa, sa):
+        if x != "-":
+            if y != "-" and qi <= qlen:
+                arr[qi] = ord(y)
+            qi += 1
+    return arr[1:]
+
+
+def cluster_redundant(uniq, aln_store, qlen, identity_pct=95, min_overlap=0.9):
+    """Group templates that are near-identical to a better-ranked one (ColabFold-style 95% filter).
+
+    Two templates are compared over the query positions both are aligned to: if they overlap
+    on >= min_overlap of the shorter one and are >= identity_pct identical there, the lower
+    ranked one joins the cluster of the higher ranked one. Comparing through the query
+    alignment avoids an all-vs-all realignment and is fast even for thousands of templates.
+    Adds columns cluster_rep (unique_rank of the representative), is_representative and
+    n_in_cluster.
+    """
+    if uniq.empty:
+        return uniq.assign(cluster_rep=[], is_representative=[], n_in_cluster=[])
+    reps, rep_rows, rep_of = [], [], []
+    thr = identity_pct / 100.0
+    for r in uniq.itertuples():
+        qa, sa = aln_store[r.entity_id]
+        a = _query_anchored_residues(qa, sa, r.query_start, qlen)
+        assigned = None
+        if reps and identity_pct < 100:
+            R = np.vstack(reps)
+            shared = (R > 0) & (a > 0)
+            n_shared = shared.sum(axis=1)
+            n_self = (a > 0).sum()
+            n_rep = (R > 0).sum(axis=1)
+            overlap_ok = n_shared >= min_overlap * np.minimum(n_self, n_rep)
+            ident = np.where(n_shared > 0, ((R == a) & shared).sum(axis=1) / np.maximum(n_shared, 1), 0)
+            ok = np.where(overlap_ok & (ident >= thr))[0]
+            if len(ok):
+                assigned = rep_rows[ok[0]]
+        if assigned is None:
+            reps.append(a)
+            rep_rows.append(r.unique_rank)
+            assigned = r.unique_rank
+        rep_of.append(assigned)
+    out = uniq.copy()
+    out["cluster_rep"] = rep_of
+    out["is_representative"] = out["cluster_rep"] == out["unique_rank"]
+    out["n_in_cluster"] = out.groupby("cluster_rep")["unique_rank"].transform("count")
+    return out
+
+
+def diverse_band_picks(uniq, per_band=2):
+    """Best non-redundant templates in each identity-to-query band (0-20, 20-40, ... %).
+
+    Mirrors ColabFold's diversity-aware filter, which keeps sequences per identity bucket so
+    that remote homologs are not crowded out by many close ones. For template choice this
+    surfaces structurally different options (other conformations, ligand states, folds).
+    """
+    if uniq.empty or per_band <= 0:
+        return uniq.head(0)
+    reps = uniq[uniq.get("is_representative", True) == True]  # noqa: E712
+    picks = []
+    for lo, hi in IDENTITY_BANDS:
+        band = reps[(reps.identity_pct >= lo) & (reps.identity_pct < hi)].head(per_band)
+        picks.append(band.assign(identity_band=f"{lo}-{min(int(hi), 100)}%"))
+    return pd.concat(picks).sort_values("identity_pct", ascending=False).reset_index(drop=True)
 
 
 def uncovered_regions(sets, qlen):
@@ -891,6 +1136,11 @@ COLUMN_DOCS = [
     ("query_start/end, template_start/end", "Alignment boundaries (template numbering = PDB entity/SEQRES numbering)."),
     ("gap_opens / gaps_in_*", "Number of indels; many gaps = harder alignment, loop modelling needed."),
     ("evalue / bitscore", "Search statistics. E-value < 1e-3 is a confident homolog."),
+    ("found_by", "Search that found the hit: rcsb, ncbi, colabfold (MSA-profile search of the PDB) or "
+                 "ncbi-unmasked (BLASTp with low-complexity filter and composition statistics switched off)."),
+    ("cluster_rep / is_representative / n_in_cluster",
+     "Redundancy clusters: templates ≥95% identical to a better-ranked one over the query positions they share "
+     "are grouped under it (unique_rank of the representative). Summary lists representatives only."),
     ("hssp_threshold_pct / hssp_distance", "Rost (1999) twilight-zone curve for this alignment length; distance > 0 = homology reliably inferred from identity."),
     ("method / resolution", "Experimental method and resolution (Å). Lower is better; ≤2.5 Å preferred."),
     ("r_free / r_work", "Crystallographic agreement factors; R-free ≤ 0.25 is good."),
@@ -900,11 +1150,14 @@ COLUMN_DOCS = [
     ("oligomeric_state / stoichiometry", "Biological assembly; relevant if you need to model an oligomer."),
     ("ligands / metal_ions", "Bound ligands (common crystallisation additives removed) and metal ions; choose holo vs apo template accordingly."),
     ("warnings", "Automatic flags that deserve a manual look."),
-    ("score_* columns", "0-1 component scores: identity (20→100%), similarity (30→100%), coverage (0→100%), resolution (3.5→1.5 Å; NMR=0.35), completeness (70→100% observed), r_free (0.32→0.20), geometry (clashscore 40→5, Rama outliers 5→0.5%). Missing data = 0.5."),
+    ("score_* columns", "0-1 component scores: identity (20→100%), similarity (30→100%), coverage (0→100%), significance (E-value 10→1e-30), resolution (3.5→1.5 Å; NMR=0.35), completeness (70→100% observed), r_free (0.32→0.20), geometry (clashscore 40→5, Rama outliers 5→0.5%). Missing data = 0.5."),
+    ("identity_band (Summary)", "Best non-redundant templates per identity-to-query band (0-20, 20-40, ... %), "
+                                "so remote but structurally different templates stay visible (cf. ColabFold's diversity filter)."),
 ]
 
 
-def write_excel(path, query_info, cfg, df, uniq, multi, coverage_sets, aln_store, uncovered, run_meta):
+def write_excel(path, query_info, cfg, df, uniq, multi, coverage_sets, aln_store, uncovered, run_meta,
+                diverse=None):
     from openpyxl import Workbook
     from openpyxl.formatting.rule import ColorScaleRule
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -1006,7 +1259,7 @@ def write_excel(path, query_info, cfg, df, uniq, multi, coverage_sets, aln_store
          ", ".join(f"{a}-{b}" for a, b in uncovered) if uncovered else "none (full coverage)"),
         ("Run date", run_meta["date"]),
         ("Run time (s)", run_meta["seconds"]),
-    ]
+    ] + list(run_meta.get("extra_info", []))
     for i, (k, v) in enumerate(info_rows, 3):
         ws.cell(row=i, column=1, value=k).font = BOLD
         ws.cell(row=i, column=2, value=v)
@@ -1018,14 +1271,30 @@ def write_excel(path, query_info, cfg, df, uniq, multi, coverage_sets, aln_store
         c.font = MONO
     r = r0 + (len(seq) - 1) // 60 + 2
 
-    ws.cell(row=r, column=1, value="Top 10 recommended templates (unique sequences)").font = TITLE
+    for note in run_meta.get("notes", []):
+        ws.cell(row=r, column=1, value="Note").font = Font(bold=True, color="C00000")
+        ws.cell(row=r, column=2, value=note).alignment = Alignment(wrap_text=True, vertical="top")
+        r += 1
+    if run_meta.get("notes"):
+        r += 1
+
+    ws.cell(row=r, column=1, value="Top 10 recommended templates (non-redundant, ≤"
+                                   f"{cfg.get('redundancy_identity_pct', 100)}% identical to each other)").font = TITLE
+    summary_cols = ["unique_rank", "pdb_id", "best_chain", "template_score", "confidence_tier",
+                    "identity_pct", "query_coverage_pct", "query_start", "query_end", "resolution",
+                    "method", "organism", "description", "ligands", "n_in_cluster", "warnings"]
     if len(uniq):
-        top = uniq.head(10)[["unique_rank", "pdb_id", "best_chain", "template_score", "confidence_tier",
-                             "identity_pct", "query_coverage_pct", "query_start", "query_end", "resolution",
-                             "method", "organism", "description", "ligands", "warnings"]]
+        reps = uniq[uniq["is_representative"]] if "is_representative" in uniq.columns else uniq
+        top = reps.head(10)[[c for c in summary_cols if c in reps.columns]]
         cols = write_df(ws, top, start_row=r + 1)
         link_pdb(ws, cols, len(top), start_row=r + 1)
         r = r + len(top) + 3
+    if diverse is not None and len(diverse):
+        ws.cell(row=r, column=1, value="Diverse templates by identity to the query (best per band)").font = TITLE
+        dv = diverse[[c for c in ["identity_band"] + summary_cols if c in diverse.columns]]
+        cols = write_df(ws, dv, start_row=r + 1)
+        link_pdb(ws, cols, len(dv), start_row=r + 1)
+        r = r + len(dv) + 3
     if len(multi) > 1:
         ws.cell(row=r, column=1, value="Suggested multi-template set (complementary coverage)").font = TITLE
         write_df(ws, multi, start_row=r + 1)
@@ -1052,6 +1321,7 @@ def write_excel(path, query_info, cfg, df, uniq, multi, coverage_sets, aln_store
              "rama_outliers_pct", "rotamer_outliers_pct", "aligned_region_observed_pct", "mutations",
              "oligomeric_state", "stoichiometry", "n_protein_entities", "n_chains_entry", "ligands", "metal_ions",
              "description", "organism", "uniprot_ids", "same_organism", "release_date", "title", "warnings",
+             "found_by", "cluster_rep", "is_representative", "n_in_cluster",
              "all_chains"] + [c for c in df.columns if c.startswith("score_")]
     if not cfg.get("prefer_organism"):
         order.remove("same_organism")
@@ -1186,14 +1456,28 @@ def write_excel(path, query_info, cfg, df, uniq, multi, coverage_sets, aln_store
 # 8. Structure download
 # ---------------------------------------------------------------------------
 def download_structures(pdb_ids, zip_path):
+    """Zip the template structures as lower-case mmCIF (e.g. 4hhb.cif).
+
+    mmCIF is always available (large entries have no legacy .pdb file) and RCSB files contain
+    _entity_poly_seq, so the files can be uploaded unchanged as ColabFold custom templates
+    (template_mode = "custom"), which requires four-letter lower-case names.
+    """
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for pid in pdb_ids:
-            for ext in ("pdb", "cif"):
-                r = _request("GET", f"https://files.rcsb.org/download/{pid}.{ext}")
+            for ext in ("cif", "pdb"):
+                r = _request("GET", f"https://files.rcsb.org/download/{pid.upper()}.{ext}")
                 if r.status_code == 200 and r.content:
-                    z.writestr(f"{pid}.{ext}", r.content)
+                    z.writestr(f"{pid.lower()}.{ext}", r.content)
                     break
     return zip_path
+
+
+def write_colabfold_input(path, name, sequence):
+    """Query in the CSV format the ColabFold AlphaFold2 notebook / colabfold_batch accept."""
+    job = re.sub(r"[^A-Za-z0-9_]+", "_", name)[:40].strip("_") or "query"
+    with open(path, "w") as fh:
+        fh.write(f"id,sequence\n{job},{sequence}\n")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -1206,7 +1490,9 @@ def run_pipeline(**overrides):
             cfg["weights"].update(v)
         elif v is not None:
             cfg[k] = v
+    cfg["search_engine"] = cfg["search_engine"].lower()
     t0 = time.time()
+    notes, extra_info = [], []
 
     print("[1/5] Resolving query ...")
     qi = fetch_query_sequence(cfg["query"])
@@ -1214,15 +1500,54 @@ def run_pipeline(**overrides):
     if len(qseq) < 20:
         raise ValueError("Query sequence must be at least 20 residues.")
     print(f"  {qi['source']}: {qi['name'][:80]}  ({len(qseq)} aa)")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", qi["source"].split()[-1] if qi["source"] != "User sequence"
+                       else "sequence")[:30]
+    lc = low_complexity_fraction(qseq)
+    extra_info.append(("Low-complexity residues in query", f"{100 * lc:.0f}%"))
 
-    print(f"[2/5] Searching PDB for homologs ({cfg['search_engine']}) ...")
-    if cfg["search_engine"].lower() == "ncbi":
+    engine = cfg["search_engine"]
+    print(f"[2/5] Searching PDB for homologs ({engine}) ...")
+    msa_info = None
+    if engine == "ncbi":
         hits = search_ncbi(qseq, cfg["evalue_cutoff"], cfg["max_hits"])
-    else:
+    elif engine == "colabfold":
+        hits, msa_info = search_colabfold(qseq, cfg["evalue_cutoff"], cfg["max_hits"],
+                                          host=cfg["colabfold_host"],
+                                          workdir=f"{cfg['output_prefix']}_{safe_name}_colabfold")
+        n = msa_info["msa_sequences"]
+        extra_info.append(("Sequences in ColabFold MSA (UniRef + environmental)", n))
+        if n < 30:
+            notes.append(f"Only {n} homologous sequences were found for the MSA. The ColabFold paper reports "
+                         "that ~30 sufficiently diverse sequences are often enough for a high-quality "
+                         "AlphaFold2 prediction, so a predicted structure of this query is less reliable.")
+    elif engine == "rcsb":
         hits = search_rcsb(qseq, cfg["evalue_cutoff"], cfg["min_identity_pct"] / 100.0, cfg["max_hits"])
+    else:
+        raise ValueError(f"Unknown search_engine {engine!r}: use 'rcsb', 'ncbi' or 'colabfold'.")
+    for h in hits:
+        h["found_by"] = engine
     print(f"  {len(hits)} homologous polymer entities found")
+
+    # second chance without masking (the ColabFold paper's CASP14 T1084 failure mode)
+    few_hits = len(hits) < cfg["low_complexity_min_hits"]
+    if cfg["low_complexity_retry"] and (few_hits or lc >= 0.25):
+        why = f"only {len(hits)} hits" if few_hits else f"{100 * lc:.0f}% low-complexity residues"
+        print(f"  {why}: re-searching NCBI BLASTp without low-complexity masking ...")
+        try:
+            extra = search_ncbi(qseq, cfg["evalue_cutoff"], cfg["max_hits"], unmasked=True)
+        except Exception as e:  # noqa: BLE001
+            extra = []
+            notes.append(f"Unmasked re-search ({why}) could not run: {e}")
+        seen = {h["entity_id"] for h in hits}
+        added = [dict(h, found_by="ncbi-unmasked") for h in extra if h["entity_id"] not in seen]
+        hits += added
+        if added:
+            notes.append(f"{len(added)} hit(s) were found only after switching off low-complexity masking "
+                         f"({why}); they are marked found_by = ncbi-unmasked. Check their alignments.")
+        print(f"  +{len(added)} additional entities from the unmasked search")
+
     if not hits:
-        print("No homologs found. Try a looser E-value cutoff or the NCBI search engine.")
+        print("No homologs found. Try a looser E-value cutoff or the 'colabfold' search engine.")
         return None
 
     print("[3/5] Fetching structure metadata & validation metrics ...")
@@ -1235,31 +1560,51 @@ def run_pipeline(**overrides):
         return None
     cov_sets = {k: v for k, v in cov_sets.items() if k in set(df.entity_id)}
     uniq = unique_templates(df)
-    multi = greedy_multitemplate(uniq, cov_sets, len(qseq))
+    uniq = cluster_redundant(uniq, aln_store, len(qseq), cfg["redundancy_identity_pct"])
+    reps = uniq[uniq.is_representative]
+    diverse = diverse_band_picks(uniq, cfg["diverse_per_band"])
+    multi = greedy_multitemplate(reps, cov_sets, len(qseq))
     unc = uncovered_regions(list(cov_sets.values()), len(qseq))
+    extra_info.append(("Non-redundant template clusters", len(reps)))
+
+    outputs = {}
+    good = reps.confidence_tier.str[0].isin(["A", "B"]).any()
+    handoff = cfg["colabfold_handoff"]
+    if handoff == "always" or (handoff == "auto" and (not good or unc)):
+        outputs["colabfold_input"] = write_colabfold_input(
+            f"{cfg['output_prefix']}_{safe_name}_colabfold_query.csv", safe_name, qseq)
+        reason = ("no tier A/B template was found" if not good else
+                  "query regions " + ", ".join(f"{a}-{b}" for a, b in unc) + " have no template")
+        notes.append(f"Because {reason}, consider predicting the structure with ColabFold (AlphaFold2 "
+                     f"notebook): paste the query sequence or use {os.path.basename(outputs['colabfold_input'])}. "
+                     "The top templates from this report can be given to it as custom templates.")
 
     print("[5/5] Writing Excel ...")
-    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", qi["source"].split()[-1] if qi["source"] != "User sequence"
-                       else "sequence")[:30]
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
     xlsx = f"{cfg['output_prefix']}_{safe_name}_{stamp}.xlsx"
     write_excel(xlsx, qi, cfg, df.drop(columns=["_entity_sequence"]), uniq.drop(columns=["_entity_sequence"]),
                 multi, cov_sets, aln_store, unc,
-                {"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "seconds": round(time.time() - t0, 1)})
-    outputs = {"excel": xlsx}
+                {"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "seconds": round(time.time() - t0, 1),
+                 "notes": notes, "extra_info": extra_info},
+                diverse=diverse.drop(columns=["_entity_sequence"], errors="ignore"))
+    outputs = {"excel": xlsx, **outputs}
 
-    if cfg["download_top_n"] and len(uniq):
+    if cfg["download_top_n"] and len(reps):
         zp = f"{cfg['output_prefix']}_{safe_name}_top{cfg['download_top_n']}_structures.zip"
-        print(f"  Downloading top {cfg['download_top_n']} template structures ...")
-        outputs["structures_zip"] = download_structures(list(dict.fromkeys(uniq.pdb_id))[:cfg["download_top_n"]], zp)
+        print(f"  Downloading top {cfg['download_top_n']} template structures (mmCIF) ...")
+        outputs["structures_zip"] = download_structures(list(dict.fromkeys(reps.pdb_id))[:cfg["download_top_n"]], zp)
 
-    print(f"\nDone in {time.time() - t0:.0f}s. {len(df)} hits, {len(uniq)} unique templates.")
+    print(f"\nDone in {time.time() - t0:.0f}s. {len(df)} hits, {len(uniq)} unique templates, "
+          f"{len(reps)} non-redundant clusters.")
     cols = ["unique_rank", "pdb_id", "best_chain", "template_score", "identity_pct", "query_coverage_pct",
-            "resolution", "method", "description"]
-    print(uniq[cols].head(10).to_string(index=False))
+            "resolution", "method", "n_in_cluster", "description"]
+    print(reps[cols].head(10).to_string(index=False))
     if unc:
         print("\nQuery regions with no template:", ", ".join(f"{a}-{b}" for a, b in unc))
-    return {"outputs": outputs, "ranked": df, "unique": uniq, "multi_template": multi, "query": qi}
+    for n in notes:
+        print("NOTE:", n)
+    return {"outputs": outputs, "ranked": df, "unique": uniq, "diverse": diverse, "multi_template": multi,
+            "query": qi, "msa_info": msa_info, "low_complexity_fraction": lc, "notes": notes}
 
 
 if __name__ == "__main__":
